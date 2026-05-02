@@ -1,0 +1,183 @@
+---
+title: "DESeq2"
+author: "Mark Lopez"
+date: "2026-04-28"
+output: html_document
+---
+
+```{r}
+BiocManager::install("DESeq2")
+install.packages("ggrepel")
+library(DESeq2)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+```
+Installed and loaded the packages required for DESeq2 from Bioconductor. DESeq2 is the main package used for differential expression analysis. It utilizes gene count data for normalizing, variant estimation and differential expression analysis using negative binomial models.
+
+```{r}
+count_data_file_path <- "rna_counts_data.csv"
+map_data_file_path <- "rna_map.csv"
+
+count_data <- read.csv(count_data_file_path, header = TRUE, row.names = 1, check.names = FALSE)
+
+map_data <- read.csv(map_data_file_path, header = TRUE, check.names = FALSE)
+
+```
+
+This section of the code reads in the two main files, the RNA-seq count file and the RNA map file. The count file contains raw gene counts, where each row is a gene and each sample column contains the number of reads mapped to that gene. The map file contains information about each sample, including the sample name and whether it belongs to the Mutation (cancer cells) or WT (non cancerous cells) group.
+
+```{r}
+map_data <- map_data %>%
+  filter(!is.na(Sample.Name), !is.na(Condition))
+
+count_data <- count_data %>%
+  select(-Length)
+
+colnames(count_data) <- colnames(count_data) %>%
+  str_replace("IDH1-", ".") %>%
+  str_replace_all("-", ".")
+
+```
+
+In this section I'm filtering and removing the incomplete rows from the map file. It also removes the length column from the count data because it is not the actual sample. Then the code changes the count data samples names so they are matching the sample names in the map file.
+
+
+```{r}
+samples_to_keep <- intersect(colnames(count_data), map_data$Sample.Name)
+
+count_data <- count_data[, samples_to_keep]
+
+map_data <- map_data %>%
+  filter(Sample.Name %in% samples_to_keep)
+
+meta_data <- data.frame(SampleName = map_data$Sample.Name, condition = map_data$Condition)
+
+meta_data <- meta_data %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "SampleName")
+
+meta_data <- meta_data[colnames(count_data), , drop = FALSE]
+
+
+```
+
+This portion keeps only the samples that are found in both the count file and the map file. It then creates the metadata table needed by DESeq2. This is important because every count-data column must match the correct metadata row for the analysis to be valid.
+
+
+```{r}
+meta_data$condition <- factor(meta_data$condition)
+
+levels(meta_data$condition)
+
+meta_data$condition <- relevel(meta_data$condition, ref = "WT")
+
+levels(meta_data$condition)
+
+table(meta_data$condition, useNA = "ifany")
+```
+
+This part of the code defines the groups being compared which are the mutation group and the WT group. The code converts the condition colums into a factor and sets WT as the reference group. This also sets up the biological comparison correctly. It makes the results match the assignment language and controls how the fold-change direction should be interpreted.
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = count_data,
+                              colData = meta_data,
+                              design = ~ condition)
+dds
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+dds
+
+```
+This section of the code builds the DESeq2 dataset by combines the count data, meta data. it also filters out genes with too little information.This is when the data are in the correct format before running differential expression test. 
+
+```{r}
+dds <- estimateSizeFactors(dds)
+
+normalized_counts <- counts(dds, normalized = TRUE)
+
+dds <- DESeq(dds)
+
+```
+
+This code section estimates size factor which normalizes for differences in the RNA-seq counts creating a normalized counts.Next it runs the main DESeq2 model. This is where DESeq2 prepares the data and tests each gene for expression differences between Mutant and Wild Type.
+
+```{r}
+res <- results(dds, contrast = c("condition", "Mutation", "WT"))
+res
+
+summary(res)
+sum(res$padj < 0.1, na.rm = TRUE)
+sum(res$padj < 0.05, na.rm = TRUE)
+
+data <- data.frame(res)
+data$gene <- rownames(data)
+
+head(data)
+
+data_sorted <- data %>%
+  arrange(padj)
+
+head(data_sorted, 20)
+```
+
+The output res is the main DESeq2 results table. The results summarizes how many genes are unregulated or down regulated. Then the sum counts how many genes have adjusted p-values below 0.1 and 0.05. Then the results are converted into a regular data frame, gene names are added as a column, and the table is sorted by adjusted p-value.
+
+
+```{r}
+rld <- rlog(dds)
+
+plotPCA(rld, intgroup = "condition")
+
+plotMA(res, ylim = c(-5, 5))
+```
+
+
+This section creates two visualizations from the DESeq2 analysis. The rlog(dds) line transforms the count data so it is easier to visualize. plotPCA() creates a PCA plot showing whether samples cluster by condition based on overall gene expression patterns.The plotMA() function creates an MA plot, where the x-axis shows average gene expression and the y-axis shows log2 fold change. In this analysis, genes above zero are higher in Mutation, while genes below zero are higher in WT.
+
+
+```{r}
+data <- data %>%
+  mutate(Expression = case_when( log2FoldChange >= 1 & padj <= 0.05 ~ "Up-regulated", log2FoldChange <= -1 & padj <= 0.05 ~ "Down-regulated", TRUE ~ "Unchanged"))
+
+top <- 10
+
+top_genes <- bind_rows(
+  data %>%
+    filter(Expression == "Up-regulated") %>%
+    arrange(padj, desc(abs(log2FoldChange))) %>%
+    head(top),
+  data %>%
+    filter(Expression == "Down-regulated") %>%
+    arrange(padj, desc(abs(log2FoldChange))) %>%
+    head(top)
+)
+
+Top_Hits <- head(arrange(data, pvalue), 10)
+
+Top_Hits
+
+data$label <- ifelse(data$gene %in% Top_Hits$gene, data$gene, "")
+
+p1 <- ggplot(data, aes(log2FoldChange, -log(pvalue, 10))) +
+  geom_point(aes(color = Expression), size = 2/5) +
+  xlab(expression("log"[2]*"FC")) +
+  ylab(expression("-log"[10]*"P-Value")) +
+  scale_color_manual(values = c("dodgerblue3", "black", "firebrick3")) +
+  xlim(-4.5, 4.5) +
+  geom_text_repel(aes(label = label), size = 2.5)
+
+p1
+```
+
+This section classifies genes as Up-regulated, Down-regulated, or Unchanged based on log2FoldChange. Genes with a log2FoldChange greater than or equal to 1 and an adjusted p-value less than or equal to 0.05 are labeled upregulated. Genes with a log2FoldChange less than or equal to -1 and an adjusted p-value less than or equal to 0.05 are labeled downregulated. All other genes are labeled unchanged.The code then creates Top_Hits using the top genes ranked by  p-value and uses those genes as labels on the volcano plot. The volcano plot shows log2FoldChange on the x-axis and -log10(pvalue) on the y-axis. Genes farther to the right are higher in Mutation, genes farther to the left are higher in WT, and genes higher on the plot have stronger statistical evidence.
+
+```{r}
+write.csv(data_sorted,
+          file = "DESeq2_Mutant_vs_WildType_results.csv",
+          row.names = FALSE)
+
+sessionInfo()
+```
+
+This final section saves the sorted DESeq2 results table as a CSV file and records the R session information. The write.csv() line creates an output file containing the sorted results. The sessionInfo() line records the R version and package versions used in the analysis.
